@@ -20,6 +20,7 @@ import (
 	hlfv1alpha1 "github.com/kfsoftware/hlf-operator/pkg/apis/hlf.kungfusoftware.es/v1alpha1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -370,33 +371,54 @@ func GetCAInfo(params GetCAInfoRequest) (*lib.GetCAInfoResponse, error) {
 	return nil, fmt.Errorf("GetCAInfo functionality not implemented for Vault yet")
 }
 
-func ReenrollUser(clientSet *kubernetes.Clientset, spec *hlfv1alpha1.VaultSpecConf, request *hlfv1alpha1.VaultPKICertificateRequest, params ReenrollUserRequest, certPem string, ecdsaKey *ecdsa.PrivateKey) (*x509.Certificate, *x509.Certificate, error) {
+func ReenrollUser(clientSet kubernetes.Interface, spec *hlfv1alpha1.VaultSpecConf, request *hlfv1alpha1.VaultPKICertificateRequest, params ReenrollUserRequest, certPem string, ecdsaKey *ecdsa.PrivateKey) (*x509.Certificate, *x509.Certificate, error) {
 	vaultClient, err := GetClient(spec, clientSet)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Create CSR data
-	csrData := map[string]interface{}{
-		"common_name": params.EnrollID,
-		"key_type":    "ec",
+	commonName := params.EnrollID
+
+	template := &x509.CertificateRequest{
+		Subject: pkix.Name{
+			CommonName: commonName,
+		},
 	}
-	if len(params.Hosts) > 0 {
-		csrData["alt_names"] = strings.Join(params.Hosts, ",")
+
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, ecdsaKey)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to create CSR")
+	}
+
+	csrPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: csrDER,
+	})
+
+	csrData := map[string]interface{}{
+		"csr":                 string(csrPEM),
+		"common_name":         commonName,
+		"use_csr_common_name": true,
+		"use_csr_sans":        true,
+		"key_type":            "ec",
 	}
 	if params.CN != "" {
 		csrData["common_name"] = params.CN
 	}
 
-	// Add TTL if specified in the request
+	if len(params.Hosts) > 0 {
+		csrData["alt_names"] = strings.Join(params.Hosts, ",")
+	}
+
 	if request.TTL != "" {
 		csrData["ttl"] = request.TTL
 	}
 
-	// Request certificate from Vault PKI using existing key
+	log.Infof("reenrolling certs for %s", commonName)
+
 	secret, err := vaultClient.Write(
 		context.Background(),
-		fmt.Sprintf("%s/issue/%s", "pki", "fabric"), // TODO: Make these configurable
+		fmt.Sprintf("%s/sign/%s", request.PKI, request.Role),
 		csrData,
 	)
 	if err != nil {
@@ -429,7 +451,7 @@ func ReenrollUser(clientSet *kubernetes.Clientset, spec *hlfv1alpha1.VaultSpecCo
 
 	return cert, caCert, nil
 }
-func EnrollUser(clientSet *kubernetes.Clientset, vaultConf *hlfv1alpha1.VaultSpecConf, request *hlfv1alpha1.VaultPKICertificateRequest, params EnrollUserRequest) (*x509.Certificate, *ecdsa.PrivateKey, *x509.Certificate, error) {
+func EnrollUser(clientSet kubernetes.Interface, vaultConf *hlfv1alpha1.VaultSpecConf, request *hlfv1alpha1.VaultPKICertificateRequest, params EnrollUserRequest) (*x509.Certificate, *ecdsa.PrivateKey, *x509.Certificate, error) {
 	// Use the provided VaultSpecConf to get a client
 	vaultClient, err := GetClient(vaultConf, clientSet)
 	if err != nil {
@@ -478,8 +500,6 @@ func EnrollUser(clientSet *kubernetes.Clientset, vaultConf *hlfv1alpha1.VaultSpe
 		"use_csr_common_name": true,
 		"use_csr_sans":        true,
 	}
-
-	// Add TTL if specified in the request
 	if request.TTL != "" {
 		csrData["ttl"] = request.TTL
 	}
@@ -541,7 +561,7 @@ func convertToVaultConfig(params FabricCAParams) *hlfv1alpha1.VaultSpecConf {
 	}
 }
 
-func GetClient(spec *hlfv1alpha1.VaultSpecConf, clientset *kubernetes.Clientset) (*vault.Client, error) {
+func GetClient(spec *hlfv1alpha1.VaultSpecConf, clientset kubernetes.Interface) (*vault.Client, error) {
 	// Configure Vault client
 	vaultConfig := vault.DefaultConfiguration()
 	vaultConfig.Address = spec.URL
